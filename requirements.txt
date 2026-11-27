@@ -1,0 +1,4 @@
+openpyxl>=3.1
+growwapi>=1.5
+pyotp>=2.9
+python-dotenv>=1.0
