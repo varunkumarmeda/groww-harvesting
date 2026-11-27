@@ -48,11 +48,17 @@ class TaxOutcome:
     wasted_loss: float  # loss used up against LTCG that was exempt anyway
 
 
-def compute_tax(stcg: float, ltcg: float, st_loss: float, lt_loss: float, p: TaxParams) -> TaxOutcome:
-    """Capital-gains tax on 111A/112A gains after setting off harvested losses.
+def compute_tax(
+    stcg: float, ltcg: float, st_loss: float, lt_loss: float, p: TaxParams, ltcg_other: float = 0.0
+) -> TaxOutcome:
+    """Capital-gains tax after setting off harvested losses.
 
-    stcg/ltcg: net realised gains so far this FY (may already be negative).
+    stcg: net short-term gains (111A; may be negative).
+    ltcg: net long-term gains under 112A (listed equity, gets the exemption; may be negative).
+    ltcg_other: net long-term gains under 112 with NO exemption (e.g. gold/silver ETFs), same rate.
     st_loss/lt_loss: harvested losses as POSITIVE amounts.
+    Losses are set off in the order that minimises tax: LTCL against no-exemption LTCG first;
+    STCL against STCG, then no-exemption LTCG, then 112A LTCG.
     Excludes surcharge, 4% cess and the basic-exemption-limit adjustment.
     """
     # Existing net losses in a bucket behave like extra harvested loss.
@@ -60,24 +66,32 @@ def compute_tax(stcg: float, ltcg: float, st_loss: float, lt_loss: float, p: Tax
         st_loss, stcg = st_loss - stcg, 0.0
     if ltcg < 0:
         lt_loss, ltcg = lt_loss - ltcg, 0.0
+    if ltcg_other < 0:
+        lt_loss, ltcg_other = lt_loss - ltcg_other, 0.0
 
-    # LTCL only against LTCG.
-    lt_used = min(lt_loss, ltcg)
+    # LTCL only against LTCG: the no-exemption bucket first.
+    used = min(lt_loss, ltcg_other)
+    other_left = ltcg_other - used
+    lt_rem = lt_loss - used
+    lt_used = min(lt_rem, ltcg)
     ltcg_left = ltcg - lt_used
-    cf_lt = lt_loss - lt_used
+    cf_lt = lt_rem - lt_used
 
     # STCL against STCG first (taxed at the higher rate), then LTCG.
     st_vs_st = min(st_loss, stcg)
     stcg_left = stcg - st_vs_st
     st_rem = st_loss - st_vs_st
+    used = min(st_rem, other_left)
+    other_left -= used
+    st_rem -= used
     st_vs_lt = min(st_rem, ltcg_left)
     ltcg_left -= st_vs_lt
     cf_st = st_rem - st_vs_lt
 
-    taxable_ltcg = max(ltcg_left - p.ltcg_exemption, 0.0)
+    taxable_ltcg = max(ltcg_left - p.ltcg_exemption, 0.0) + other_left
     # Loss that only pushed LTCG further below the exemption bought nothing.
     ltcg_reduction = ltcg - ltcg_left
-    taxable_reduction = max(ltcg - p.ltcg_exemption, 0.0) - taxable_ltcg
+    taxable_reduction = max(ltcg - p.ltcg_exemption, 0.0) - max(ltcg_left - p.ltcg_exemption, 0.0)
     wasted = ltcg_reduction - taxable_reduction
 
     tax = p.stcg_rate * stcg_left + p.ltcg_rate * taxable_ltcg

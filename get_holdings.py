@@ -6,30 +6,10 @@ Credentials come from .env; see groww_auth.py.
 
 import sys
 
-from groww_auth import AuthError, fetch_holdings_raw, get_client, save_snapshot
+from groww_auth import AuthError, fetch_holdings_raw, get_client, ltp_map, save_snapshot
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-
-
-def ltp_map(client, symbols):
-    """Last traded prices keyed by trading symbol. Best-effort: {} on failure."""
-    from growwapi import GrowwAPI
-
-    prices = {}
-    for i in range(0, len(symbols), 50):  # API accepts up to 50 symbols per call
-        batch = tuple(f"NSE_{s}" for s in symbols[i:i + 50])
-        try:
-            data = client.get_ltp(exchange_trading_symbols=batch, segment=GrowwAPI.SEGMENT_CASH, timeout=10)
-        except Exception as e:
-            print(f"(LTP lookup failed: {e})")
-            return prices
-        for k, v in (data or {}).items():
-            try:
-                prices[k.split("_", 1)[-1]] = float(v.get("ltp") if isinstance(v, dict) else v)
-            except (TypeError, ValueError):
-                pass
-    return prices
 
 
 def main() -> int:

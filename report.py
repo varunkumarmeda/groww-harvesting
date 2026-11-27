@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 import warnings
 from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -205,3 +206,15 @@ def reconcile_with_summary(report: Report) -> List[str]:
                     f"{label} {term}: rows sum to {got:,.2f} but Summary says {expected[term]:,.2f}"
                 )
     return issues
+
+
+def report_date(path) -> date:
+    """Date the report was generated: from Groww's filename (..._DD-MM-YYYY_...), else file mtime."""
+    path = Path(path)
+    m = re.search(r"(\d{2})-(\d{2})-(\d{4})", path.name)
+    if m:
+        try:
+            return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        except ValueError:
+            pass
+    return datetime.fromtimestamp(path.stat().st_mtime).date()

@@ -96,3 +96,23 @@ def holdings_by_isin(raw: list) -> Dict[str, "Holding"]:
             sellable_quantity=max(qty - locked, 0.0),
         )
     return result
+
+
+def ltp_map(client, symbols):
+    """Last traded prices keyed by trading symbol. Best-effort: {} on failure."""
+    from growwapi import GrowwAPI
+
+    prices = {}
+    for i in range(0, len(symbols), 50):  # API accepts up to 50 symbols per call
+        batch = tuple(f"NSE_{s}" for s in symbols[i:i + 50])
+        try:
+            data = client.get_ltp(exchange_trading_symbols=batch, segment=GrowwAPI.SEGMENT_CASH, timeout=10)
+        except Exception as e:
+            print(f"(LTP lookup failed: {e})")
+            return prices
+        for k, v in (data or {}).items():
+            try:
+                prices[k.split("_", 1)[-1]] = float(v.get("ltp") if isinstance(v, dict) else v)
+            except (TypeError, ValueError):
+                pass
+    return prices

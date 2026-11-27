@@ -15,6 +15,7 @@ import csv
 import json
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional
@@ -173,12 +174,12 @@ def execute(client, orders: List[Candidate], assume_yes: bool) -> None:
 # --------------------------------------------------------------------------- CLI
 
 
-def parse_args(argv=None):
-    ap = argparse.ArgumentParser(description="Plan (and optionally execute) tax-loss harvesting from a Groww report.")
+def add_plan_args(ap: argparse.ArgumentParser, default_term: str = "all") -> None:
+    """Arguments shared by harvest.py and portfolio_report.py."""
     ap.add_argument("--report", type=Path, help="Groww Tax Loss Harvesting XLSX (default: newest in this folder)")
     ap.add_argument("--asset", choices=["stocks", "mf", "all"], default="all")
-    ap.add_argument("--term", choices=["st", "lt", "all"], default="all",
-                    help="Holdings to consider, by the term of their loss lots (FIFO still applies)")
+    ap.add_argument("--term", choices=["st", "lt", "all"], default=default_term,
+                    help=f"Holdings to consider, by the term of their loss lots; FIFO still applies (default {default_term})")
     ap.add_argument("--min-loss", type=float, default=0,
                     help="Ignore holdings whose total loss is smaller than this many rupees (charges can exceed tiny losses)")
     ap.add_argument("--stcg", type=float, help="Net STCG (111A) already realised this FY, in rupees")
@@ -190,6 +191,79 @@ def parse_args(argv=None):
     ap.add_argument("--ltcg-exemption", type=float, default=125000, help="LTCG exemption (default 125000)")
     ap.add_argument("--holdings", action="store_true", help="Fetch live holdings via Groww API to verify the plan")
     ap.add_argument("--holdings-file", type=Path, help="Use a saved holdings JSON (from get_holdings.py) instead")
+
+
+@dataclass
+class Plan:
+    report_path: Path
+    report: object
+    cands: List[Candidate]
+    params: TaxParams
+    issues: List[str]
+    raw_holdings: Optional[list] = None  # None = no holdings data
+    holdings_source: Optional[str] = None
+    client: object = None
+
+
+class PlanError(Exception):
+    pass
+
+
+def build_plan(args, verbose: bool = True) -> Plan:
+    """Report -> grouped candidates -> holdings checks -> tax selection."""
+    log = print if verbose else (lambda *a, **k: None)
+    if (args.stcg is None) != (args.ltcg is None):
+        raise PlanError("Pass both --stcg and --ltcg (use 0 for none).")
+    report_path = args.report or newest_report()
+    if report_path is None:
+        raise PlanError("No report given and none named Tax_Loss_Harvesting_Report*.xlsx found here.")
+    report = load_report(report_path)
+    log(f"Report: {report_path}  ({len(report.stocks)} stock lots, {len(report.mutual_funds)} MF lots)")
+    issues = reconcile_with_summary(report)
+    for issue in issues:
+        log(f"⚠ {issue}")
+
+    lots = (report.stocks if args.asset in ("stocks", "all") else []) + (
+        report.mutual_funds if args.asset in ("mf", "all") else []
+    )
+    cands = apply_term_filter(group_lots(lots), args.term)
+    cands = [c for c in cands if -c.total_loss >= args.min_loss]
+
+    plan = Plan(report_path, report, cands, TaxParams(args.stcg_rate / 100, args.ltcg_rate / 100, args.ltcg_exemption), issues)
+    holdings = None
+    if args.holdings:
+        from groww_auth import fetch_holdings_raw, get_client, holdings_by_isin, save_snapshot
+
+        try:
+            plan.client = get_client()
+            plan.raw_holdings = fetch_holdings_raw(plan.client)
+        except Exception as e:
+            raise PlanError(
+                f"Couldn't fetch live holdings: {e}\n"
+                "Refresh the credentials in .env (access tokens expire daily), or run without --holdings."
+            ) from e
+        snap = save_snapshot(plan.raw_holdings)
+        plan.holdings_source = f"Live Groww API ({datetime.now():%d %b %Y %H:%M}), snapshot {snap}"
+        log(f"Live holdings: {len(plan.raw_holdings)} (snapshot {snap})")
+        holdings = holdings_by_isin(plan.raw_holdings)
+    elif args.holdings_file:
+        from groww_auth import holdings_by_isin
+
+        data = json.loads(args.holdings_file.read_text(encoding="utf-8"))
+        plan.raw_holdings = data.get("holdings", []) if isinstance(data, dict) else data
+        plan.holdings_source = f"Holdings file {args.holdings_file}"
+        holdings = holdings_by_isin(plan.raw_holdings)
+        log(f"Holdings file: {args.holdings_file} ({len(holdings)} ISINs)")
+    apply_holdings(cands, holdings)
+
+    if args.stcg is not None and not args.harvest_all:
+        select_for_tax(cands, args.stcg, args.ltcg, plan.params)
+    return plan
+
+
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(description="Plan (and optionally execute) tax-loss harvesting from a Groww report.")
+    add_plan_args(ap)
     ap.add_argument("--csv", type=Path, help="Write the plan to this CSV (default: output/plan_<timestamp>.csv)")
     ap.add_argument("--execute", action="store_true", help="Place SELL orders for OK + selected stocks (needs --holdings)")
     ap.add_argument("--yes", action="store_true", help="Skip the typed confirmation (not recommended)")
@@ -198,54 +272,20 @@ def parse_args(argv=None):
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    if (args.stcg is None) != (args.ltcg is None):
-        print("Pass both --stcg and --ltcg (use 0 for none).")
-        return 2
     if args.execute and not args.holdings:
         print("--execute needs --holdings: orders are only placed after checking live quantities.")
         return 2
-
-    report_path = args.report or newest_report()
-    if report_path is None:
-        print("No report given and none named Tax_Loss_Harvesting_Report*.xlsx found here.")
+    try:
+        plan = build_plan(args)
+    except PlanError as e:
+        print(e)
         return 2
-    report = load_report(report_path)
-    print(f"Report: {report_path}  ({len(report.stocks)} stock lots, {len(report.mutual_funds)} MF lots)")
-    for issue in reconcile_with_summary(report):
-        print(f"⚠ {issue}")
-
-    lots = (report.stocks if args.asset in ("stocks", "all") else []) + (
-        report.mutual_funds if args.asset in ("mf", "all") else []
-    )
-    cands = apply_term_filter(group_lots(lots), args.term)
-    cands = [c for c in cands if -c.total_loss >= args.min_loss]
-
-    client = None
-    holdings = None
-    if args.holdings:
-        from groww_auth import fetch_holdings_raw, get_client, holdings_by_isin, save_snapshot
-
-        client = get_client()
-        raw = fetch_holdings_raw(client)
-        print(f"Live holdings: {len(raw)} (snapshot {save_snapshot(raw)})")
-        holdings = holdings_by_isin(raw)
-    elif args.holdings_file:
-        from groww_auth import holdings_by_isin
-
-        data = json.loads(args.holdings_file.read_text(encoding="utf-8"))
-        holdings = holdings_by_isin(data.get("holdings", data) if isinstance(data, dict) else data)
-        print(f"Holdings file: {args.holdings_file} ({len(holdings)} ISINs)")
-    apply_holdings(cands, holdings)
-
-    params = TaxParams(args.stcg_rate / 100, args.ltcg_rate / 100, args.ltcg_exemption)
-    have_gains = args.stcg is not None
-    if have_gains and not args.harvest_all:
-        select_for_tax(cands, args.stcg, args.ltcg, params)
+    cands = plan.cands
 
     print()
     print_plan(cands)
-    if have_gains:
-        print_tax(args.stcg, args.ltcg, cands, params)
+    if args.stcg is not None:
+        print_tax(args.stcg, args.ltcg, cands, plan.params)
     else:
         st, lt = harvested_losses(cands)
         print(f"\nTotal if all sold: ST loss {rs(st)}, LT loss {rs(lt)}.")
@@ -266,7 +306,7 @@ def main(argv=None) -> int:
     if not orders:
         print("Nothing is safe to auto-sell.")
         return 0
-    execute(client, orders, args.yes)
+    execute(plan.client, orders, args.yes)
     return 0
 
 
